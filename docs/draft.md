@@ -40,7 +40,7 @@
 ## Next Target Note
 
 - The next target is below 1000 cycles.
-- The current best correct candidate is 1102 cycles.
+- The current best correct candidate is 1098 cycles.
 - Current engine floors are still above 1000 for load, VALU, and ALU, so further progress requires reducing total work, not just improving scheduling.
-- Current slot counts are `load=2130`, `valu=6276`, `alu=12544`, `flow=799`, `store=32`, giving lower bounds of `1065`, `1046`, `1046`, `799`, and `16` cycles respectively.
+- Current slot counts are `load=2130`, `valu=6277`, `alu=8448`, `flow=799`, `store=32`, giving lower bounds of `1065`, `1047`, `704`, `799`, and `16` cycles respectively.
 - A valid instruction-stream solution below 1000 needs a qualitatively different work-reduction idea: fewer deep gathers, fewer hash-equivalent operations, or a different way to compute/route paths. Pure scheduling and local engine reassignment are exhausted among the variants tested so far.

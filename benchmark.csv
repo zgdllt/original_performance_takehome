@@ -6,3 +6,4 @@ wavefront_offset_madd_alu_hash,1191,passes official submission tests and target 
 wavefront16_depth1_vselect,1142,passes official submission tests; best legal parameter sweep so far for <1000 attempt
 depth23_vselect_tree,invalid,rejected; reduced VALU slots but failed correctness
 wavefront13_precompute_war_offsets,1102,passes official submission tests; precomputed shallow next-node values plus WAR-aware scheduler and custom offsets
+hash23_fused_rescan,1098,passes official submission tests; combines hash stages 2 and 3 into two multiply_adds plus xor and rescans WAR-blocked candidates within each engine

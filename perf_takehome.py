@@ -113,18 +113,24 @@ class KernelBuilder:
                     i for i in ready if not scheduled[i] and tasks[i]["engine"] == engine
                 ]
                 candidates.sort(key=lambda i: (-priority[i], -i))
-                for i in candidates:
-                    if len(bundle.get(engine, [])) >= limit:
+                while len(bundle.get(engine, [])) < limit:
+                    made_progress = False
+                    for i in candidates:
+                        if scheduled[i]:
+                            continue
+                        if any(
+                            (not scheduled[dep] and dep not in selected)
+                            for dep in tasks[i].get("anti_deps", ())
+                        ):
+                            continue
+                        selected.append(i)
+                        bundle.setdefault(engine, []).append(tasks[i]["slot"])
+                        scheduled[i] = True
+                        ready_set.remove(i)
+                        made_progress = True
                         break
-                    if any(
-                        (not scheduled[dep] and dep not in selected)
-                        for dep in tasks[i].get("anti_deps", ())
-                    ):
-                        continue
-                    selected.append(i)
-                    bundle.setdefault(engine, []).append(tasks[i]["slot"])
-                    scheduled[i] = True
-                    ready_set.remove(i)
+                    if not made_progress:
+                        break
 
             if not selected:
                 raise RuntimeError("Scheduler made no progress")
@@ -295,11 +301,12 @@ class KernelBuilder:
         two_v = init_vec_const("two_v", 2)
         m4097_v = init_vec_const("m4097_v", 4097)
         m33_v = init_vec_const("m33_v", 33)
+        m16896_v = init_vec_const("m16896_v", 16896)
         m9_v = init_vec_const("m9_v", 9)
         c0_v = init_vec_const("c0_v", 0x7ED55D16)
-        c2_v = init_vec_const("c2_v", 0x165667B1)
+        c23_v = init_vec_const("c23_v", 0xE9F8CC1D)
+        c2sh9_v = init_vec_const("c2sh9_v", 0xACCF6200)
         c4_v = init_vec_const("c4_v", 0xFD7046C5)
-        sh9_v = init_vec_const("sh9_v", 9)
         sh16_v = init_vec_const("sh16_v", 16)
         sh19_v = init_vec_const("sh19_v", 19)
         depth4_base_v = init_vec_const("depth4_base_v", 22)
@@ -309,11 +316,9 @@ class KernelBuilder:
 
         one_s = self.alloc_scratch("one_s")
         c1_s = self.alloc_scratch("c1_s")
-        c3_s = self.alloc_scratch("c3_s")
         c5_s = self.alloc_scratch("c5_s")
         load_scalar_const(one_s, 1)
         load_scalar_const(c1_s, 0xC761C23C)
-        load_scalar_const(c3_s, 0xD3A2646C)
         load_scalar_const(c5_s, 0xB55A4F09)
 
         root_node_v = load_tree_node_vec("root_node_v", 7)
@@ -400,11 +405,8 @@ class KernelBuilder:
                 vec_op("^", vals[block], vals[block], tmp0s[block])
 
             for block in ids:
-                vec_madd(vals[block], vals[block], m33_v, c2_v)
-
-            for block in ids:
-                vec_op("<<", tmp0s[block], vals[block], sh9_v)
-                alu_lanes_scalar("+", vals[block], vals[block], c3_s)
+                vec_madd(tmp0s[block], vals[block], m33_v, c23_v)
+                vec_madd(vals[block], vals[block], m16896_v, c2sh9_v)
             for block in ids:
                 vec_op("^", vals[block], vals[block], tmp0s[block])
 
