@@ -112,8 +112,15 @@ class KernelBuilder:
                 candidates = [
                     i for i in ready if not scheduled[i] and tasks[i]["engine"] == engine
                 ]
-                candidates.sort(key=lambda i: (-priority[i], i))
-                for i in candidates[:limit]:
+                candidates.sort(key=lambda i: (-priority[i], -i))
+                for i in candidates:
+                    if len(bundle.get(engine, [])) >= limit:
+                        break
+                    if any(
+                        (not scheduled[dep] and dep not in selected)
+                        for dep in tasks[i].get("anti_deps", ())
+                    ):
+                        continue
                     selected.append(i)
                     bundle.setdefault(engine, []).append(tasks[i]["slot"])
                     scheduled[i] = True
@@ -164,10 +171,19 @@ class KernelBuilder:
             for addr in writes:
                 if addr in last_writer:
                     deps.add(last_writer[addr])
-                deps.update(last_readers[addr])
+            anti_deps = set()
+            for addr in writes:
+                anti_deps.update(last_readers[addr])
 
             task_id = len(tasks)
-            tasks.append({"engine": engine, "slot": slot, "deps": deps})
+            tasks.append(
+                {
+                    "engine": engine,
+                    "slot": slot,
+                    "deps": deps,
+                    "anti_deps": anti_deps,
+                }
+            )
 
             write_set = set(writes)
             for addr in reads:
@@ -287,6 +303,7 @@ class KernelBuilder:
         sh16_v = init_vec_const("sh16_v", 16)
         sh19_v = init_vec_const("sh19_v", 19)
         depth4_base_v = init_vec_const("depth4_base_v", 22)
+        depth4_odd_v = init_vec_const("depth4_odd_v", 23)
         add_even_v = init_vec_const("add_even_v", -6)
         add_odd_v = init_vec_const("add_odd_v", -5)
 
@@ -326,7 +343,6 @@ class KernelBuilder:
 
         bit0 = alloc_vec("bit0")
         bit1 = alloc_vec("bit1")
-        bit2 = alloc_vec("bit2")
         mix = alloc_vec("mix")
         pair = alloc_vec("pair")
 
@@ -344,7 +360,15 @@ class KernelBuilder:
             tmp0_v = alloc_vec(f"tmp0_{block}")
             tmp1_v = alloc_vec(f"tmp1_{block}")
             base = self.alloc_scratch(f"value_base_{block}")
-            load_scalar_const(base, inp_values_p + block * VLEN)
+            if block == 0:
+                load_scalar_const(base, inp_values_p)
+            else:
+                add_task(
+                    "flow",
+                    ("add_imm", base, store_addrs[-1], VLEN),
+                    reads=(store_addrs[-1],),
+                    writes=(base,),
+                )
             add_task(
                 "load",
                 ("vload", val_v, base),
@@ -358,7 +382,7 @@ class KernelBuilder:
             store_addrs.append(base)
 
         tile_ids = list(range(n_vecs))
-        n_groups = 16
+        n_groups = 13
         stagger = 2
         group_ids = [
             tile_ids[g * n_vecs // n_groups : (g + 1) * n_vecs // n_groups]
@@ -413,40 +437,36 @@ class KernelBuilder:
             emit_hash(ids)
             for block in ids:
                 emit_parity(tmp0s[block], vals[block])
+                vec_select(tmp1s[block], tmp0s[block], d2_n1, d2_n0)
+                vec_select(mix, tmp0s[block], d2_diff1, d2_diff0)
+                vec_madd(tmp1s[block], idxs[block], mix, tmp1s[block])
                 vec_madd(idxs[block], idxs[block], two_v, tmp0s[block])
 
         def round_depth2(ids):
             for block in ids:
-                vec_op("&", bit0, idxs[block], one_v)
-                vec_op(">>", bit1, idxs[block], one_v)
-                vec_select(tmp0s[block], bit0, d2_n1, d2_n0)
-                vec_select(mix, bit0, d2_diff1, d2_diff0)
-                vec_madd(tmp0s[block], bit1, mix, tmp0s[block])
-                vec_op("^", vals[block], vals[block], tmp0s[block])
+                vec_op("^", vals[block], vals[block], tmp1s[block])
             emit_hash(ids)
             for block in ids:
                 emit_parity(tmp0s[block], vals[block])
+                vec_op("&", bit0, idxs[block], one_v)
+                vec_op(">>", bit1, idxs[block], one_v)
+                vec_select(tmp1s[block], tmp0s[block], d3_n1, d3_n0)
+                vec_select(mix, tmp0s[block], d3_diff_lo1, d3_diff_lo0)
+                vec_madd(tmp1s[block], bit0, mix, tmp1s[block])
+                vec_select(pair, tmp0s[block], d3_n5, d3_n4)
+                vec_select(mix, tmp0s[block], d3_diff_hi1, d3_diff_hi0)
+                vec_madd(pair, bit0, mix, pair)
+                vec_select(tmp1s[block], bit1, pair, tmp1s[block])
                 vec_madd(idxs[block], idxs[block], two_v, tmp0s[block])
 
         def round_depth3(ids):
             for block in ids:
-                vec_op("&", bit0, idxs[block], one_v)
-                vec_op(">>", bit1, idxs[block], one_v)
-                vec_op("&", bit2, bit1, one_v)
-                vec_op(">>", bit1, idxs[block], two_v)
-                vec_select(tmp0s[block], bit0, d3_n1, d3_n0)
-                vec_select(mix, bit0, d3_diff_lo1, d3_diff_lo0)
-                vec_madd(tmp0s[block], bit2, mix, tmp0s[block])
-                vec_select(pair, bit0, d3_n5, d3_n4)
-                vec_select(mix, bit0, d3_diff_hi1, d3_diff_hi0)
-                vec_madd(pair, bit2, mix, pair)
-                vec_select(tmp0s[block], bit1, pair, tmp0s[block])
-                alu_lanes("^", vals[block], vals[block], tmp0s[block])
+                vec_op("^", vals[block], vals[block], tmp1s[block])
             emit_hash(ids)
             for block in ids:
                 emit_parity(tmp0s[block], vals[block])
-                vec_madd(idxs[block], idxs[block], two_v, tmp0s[block])
-                vec_op("+", idxs[block], idxs[block], depth4_base_v)
+                vec_select(tmp1s[block], tmp0s[block], depth4_odd_v, depth4_base_v)
+                vec_madd(idxs[block], idxs[block], two_v, tmp1s[block])
 
         def round_gather(ids, update_idx):
             for block in ids:
@@ -481,9 +501,10 @@ class KernelBuilder:
                     update_idx=(round_i != forest_height and round_i != rounds - 1),
                 )
 
-        for schedule_round in range(rounds + stagger * (n_groups - 1)):
+        group_offsets = [0, 0, 6, 8, 8, 11, 12, 14, 17, 19, 20, 21, 22]
+        for schedule_round in range(rounds + max(group_offsets)):
             for group, ids in enumerate(group_ids):
-                round_i = schedule_round - group * stagger
+                round_i = schedule_round - group_offsets[group]
                 if 0 <= round_i < rounds:
                     emit_round(ids, round_i)
 

@@ -5,3 +5,4 @@ offset_madd_alu_hash,1404,correct on submission tests; only final 1363 threshold
 wavefront_offset_madd_alu_hash,1191,passes official submission tests and target <1200
 wavefront16_depth1_vselect,1142,passes official submission tests; best legal parameter sweep so far for <1000 attempt
 depth23_vselect_tree,invalid,rejected; reduced VALU slots but failed correctness
+wavefront13_precompute_war_offsets,1102,passes official submission tests; precomputed shallow next-node values plus WAR-aware scheduler and custom offsets
