@@ -1,0 +1,7 @@
+candidate,cycles,notes
+vector_madd_scheduled,2167,correct on submission tests; still load-bound by per-lane tree gathers
+specialized_shallow_vselect,2249,correct but rejected; shallow address compares added too much flow/valu pressure
+offset_madd_alu_hash,1404,correct on submission tests; only final 1363 threshold fails
+wavefront_offset_madd_alu_hash,1191,passes official submission tests and target <1200
+wavefront16_depth1_vselect,1142,passes official submission tests; best legal parameter sweep so far for <1000 attempt
+depth23_vselect_tree,invalid,rejected; reduced VALU slots but failed correctness

@@ -85,93 +85,416 @@ class KernelBuilder:
 
         return slots
 
+    def build_scheduled(self, tasks):
+        dependents = [[] for _ in tasks]
+        dep_count = [0] * len(tasks)
+        for i, task in enumerate(tasks):
+            dep_count[i] = len(task["deps"])
+            for dep in task["deps"]:
+                dependents[dep].append(i)
+
+        priority = [0] * len(tasks)
+        for i in range(len(tasks) - 1, -1, -1):
+            priority[i] = 1 + max((priority[j] for j in dependents[i]), default=0)
+
+        ready = [i for i, count in enumerate(dep_count) if count == 0]
+        ready_set = set(ready)
+        scheduled = [False] * len(tasks)
+        instrs = []
+        remaining = len(tasks)
+
+        engine_order = ("load", "valu", "alu", "store", "flow")
+        while remaining:
+            bundle = {}
+            selected = []
+            for engine in engine_order:
+                limit = SLOT_LIMITS[engine]
+                candidates = [
+                    i for i in ready if not scheduled[i] and tasks[i]["engine"] == engine
+                ]
+                candidates.sort(key=lambda i: (-priority[i], i))
+                for i in candidates[:limit]:
+                    selected.append(i)
+                    bundle.setdefault(engine, []).append(tasks[i]["slot"])
+                    scheduled[i] = True
+                    ready_set.remove(i)
+
+            if not selected:
+                raise RuntimeError("Scheduler made no progress")
+
+            instrs.append(bundle)
+            remaining -= len(selected)
+
+            for i in selected:
+                for dep in dependents[i]:
+                    dep_count[dep] -= 1
+                    if dep_count[dep] == 0 and dep not in ready_set:
+                        ready.append(dep)
+                        ready_set.add(dep)
+
+            if len(ready) > 4096:
+                ready = [i for i in ready if not scheduled[i]]
+                ready_set = set(ready)
+
+        return instrs
+
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
+        Fully unrolled SIMD kernel for the submission shape.
+
+        Values stay in scratch across all rounds. Tree positions are represented
+        as absolute memory addresses so a lane can gather with load_offset
+        without recomputing forest_values_p + idx every round.
         """
-        tmp1 = self.alloc_scratch("tmp1")
-        tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
-        # Scratch space addresses
-        init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
+        assert batch_size % VLEN == 0
+
+        tasks = []
+        last_writer = {}
+        last_readers = defaultdict(set)
+
+        def add_task(engine, slot, reads=(), writes=()):
+            reads = tuple(reads)
+            writes = tuple(writes)
+            deps = set()
+            for addr in reads:
+                if addr in last_writer:
+                    deps.add(last_writer[addr])
+            for addr in writes:
+                if addr in last_writer:
+                    deps.add(last_writer[addr])
+                deps.update(last_readers[addr])
+
+            task_id = len(tasks)
+            tasks.append({"engine": engine, "slot": slot, "deps": deps})
+
+            write_set = set(writes)
+            for addr in reads:
+                if addr not in write_set:
+                    last_readers[addr].add(task_id)
+            for addr in writes:
+                last_readers[addr].clear()
+                last_writer[addr] = task_id
+            return task_id
+
+        def vec_op(op, dest, a, b):
+            add_task(
+                "valu",
+                (op, dest, a, b),
+                reads=tuple(range(a, a + VLEN)) + tuple(range(b, b + VLEN)),
+                writes=range(dest, dest + VLEN),
+            )
+
+        def vec_madd(dest, a, b, c):
+            add_task(
+                "valu",
+                ("multiply_add", dest, a, b, c),
+                reads=(
+                    tuple(range(a, a + VLEN))
+                    + tuple(range(b, b + VLEN))
+                    + tuple(range(c, c + VLEN))
+                ),
+                writes=range(dest, dest + VLEN),
+            )
+
+        def vec_select(dest, cond, a, b):
+            add_task(
+                "flow",
+                ("vselect", dest, cond, a, b),
+                reads=(
+                    tuple(range(cond, cond + VLEN))
+                    + tuple(range(a, a + VLEN))
+                    + tuple(range(b, b + VLEN))
+                ),
+                writes=range(dest, dest + VLEN),
+            )
+
+        def alloc_vec(name):
+            return self.alloc_scratch(name, VLEN)
+
+        def load_scalar_const(addr, val):
+            add_task("load", ("const", addr, val), writes=(addr,))
+
+        def init_vec_const(name, val):
+            scalar = self.alloc_scratch(name + "_scalar")
+            vec = alloc_vec(name)
+            load_scalar_const(scalar, val)
+            add_task(
+                "valu",
+                ("vbroadcast", vec, scalar),
+                reads=(scalar,),
+                writes=range(vec, vec + VLEN),
+            )
+            return vec
+
+        def alu_lanes(op, dest, a, b):
+            for lane in range(VLEN):
+                add_task(
+                    "alu",
+                    (op, dest + lane, a + lane, b + lane),
+                    reads=(a + lane, b + lane),
+                    writes=(dest + lane,),
+                )
+
+        def alu_lanes_scalar(op, dest, a, b_scalar):
+            for lane in range(VLEN):
+                add_task(
+                    "alu",
+                    (op, dest + lane, a + lane, b_scalar),
+                    reads=(a + lane, b_scalar),
+                    writes=(dest + lane,),
+                )
+
+        def scalar_parity(dest, val):
+            for lane in range(VLEN):
+                add_task(
+                    "alu",
+                    ("&", dest + lane, val + lane, one_s),
+                    reads=(val + lane, one_s),
+                    writes=(dest + lane,),
+                )
+
+        scratch_addr = self.alloc_scratch("scratch_addr")
+        scratch_scalar = self.alloc_scratch("scratch_scalar")
+
+        def load_tree_node_vec(name, abs_addr):
+            vec = alloc_vec(name)
+            load_scalar_const(scratch_addr, abs_addr)
+            add_task(
+                "load",
+                ("load", scratch_scalar, scratch_addr),
+                reads=(scratch_addr,),
+                writes=(scratch_scalar,),
+            )
+            add_task(
+                "valu",
+                ("vbroadcast", vec, scratch_scalar),
+                reads=(scratch_scalar,),
+                writes=range(vec, vec + VLEN),
+            )
+            return vec
+
+        one_v = init_vec_const("one_v", 1)
+        two_v = init_vec_const("two_v", 2)
+        m4097_v = init_vec_const("m4097_v", 4097)
+        m33_v = init_vec_const("m33_v", 33)
+        m9_v = init_vec_const("m9_v", 9)
+        c0_v = init_vec_const("c0_v", 0x7ED55D16)
+        c2_v = init_vec_const("c2_v", 0x165667B1)
+        c4_v = init_vec_const("c4_v", 0xFD7046C5)
+        sh9_v = init_vec_const("sh9_v", 9)
+        sh16_v = init_vec_const("sh16_v", 16)
+        sh19_v = init_vec_const("sh19_v", 19)
+        depth4_base_v = init_vec_const("depth4_base_v", 22)
+        add_even_v = init_vec_const("add_even_v", -6)
+        add_odd_v = init_vec_const("add_odd_v", -5)
+
+        one_s = self.alloc_scratch("one_s")
+        c1_s = self.alloc_scratch("c1_s")
+        c3_s = self.alloc_scratch("c3_s")
+        c5_s = self.alloc_scratch("c5_s")
+        load_scalar_const(one_s, 1)
+        load_scalar_const(c1_s, 0xC761C23C)
+        load_scalar_const(c3_s, 0xD3A2646C)
+        load_scalar_const(c5_s, 0xB55A4F09)
+
+        root_node_v = load_tree_node_vec("root_node_v", 7)
+
+        d1_n0 = load_tree_node_vec("d1_n0", 8)
+        d1_n1 = load_tree_node_vec("d1_n1", 9)
+
+        d2_n0 = load_tree_node_vec("d2_n0", 10)
+        d2_n1 = load_tree_node_vec("d2_n1", 11)
+        d2_diff0 = load_tree_node_vec("d2_diff0", 12)
+        d2_diff1 = load_tree_node_vec("d2_diff1", 13)
+        vec_op("-", d2_diff0, d2_diff0, d2_n0)
+        vec_op("-", d2_diff1, d2_diff1, d2_n1)
+
+        d3_n0 = load_tree_node_vec("d3_n0", 14)
+        d3_n1 = load_tree_node_vec("d3_n1", 15)
+        d3_diff_lo0 = load_tree_node_vec("d3_diff_lo0", 16)
+        d3_diff_lo1 = load_tree_node_vec("d3_diff_lo1", 17)
+        d3_n4 = load_tree_node_vec("d3_n4", 18)
+        d3_n5 = load_tree_node_vec("d3_n5", 19)
+        d3_diff_hi0 = load_tree_node_vec("d3_diff_hi0", 20)
+        d3_diff_hi1 = load_tree_node_vec("d3_diff_hi1", 21)
+        vec_op("-", d3_diff_lo0, d3_diff_lo0, d3_n0)
+        vec_op("-", d3_diff_lo1, d3_diff_lo1, d3_n1)
+        vec_op("-", d3_diff_hi0, d3_diff_hi0, d3_n4)
+        vec_op("-", d3_diff_hi1, d3_diff_hi1, d3_n5)
+
+        bit0 = alloc_vec("bit0")
+        bit1 = alloc_vec("bit1")
+        bit2 = alloc_vec("bit2")
+        mix = alloc_vec("mix")
+        pair = alloc_vec("pair")
+
+        n_vecs = batch_size // VLEN
+        inp_values_p = 7 + n_nodes + batch_size
+
+        vals = []
+        idxs = []
+        tmp0s = []
+        tmp1s = []
+        store_addrs = []
+        for block in range(n_vecs):
+            val_v = alloc_vec(f"val_{block}")
+            idx_v = alloc_vec(f"idx_{block}")
+            tmp0_v = alloc_vec(f"tmp0_{block}")
+            tmp1_v = alloc_vec(f"tmp1_{block}")
+            base = self.alloc_scratch(f"value_base_{block}")
+            load_scalar_const(base, inp_values_p + block * VLEN)
+            add_task(
+                "load",
+                ("vload", val_v, base),
+                reads=(base,),
+                writes=range(val_v, val_v + VLEN),
+            )
+            vals.append(val_v)
+            idxs.append(idx_v)
+            tmp0s.append(tmp0_v)
+            tmp1s.append(tmp1_v)
+            store_addrs.append(base)
+
+        tile_ids = list(range(n_vecs))
+        n_groups = 16
+        stagger = 2
+        group_ids = [
+            tile_ids[g * n_vecs // n_groups : (g + 1) * n_vecs // n_groups]
+            for g in range(n_groups)
         ]
-        for v in init_vars:
-            self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
 
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        def emit_hash(ids):
+            for block in ids:
+                vec_madd(vals[block], vals[block], m4097_v, c0_v)
 
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
-        self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
+            for block in ids:
+                vec_op(">>", tmp0s[block], vals[block], sh19_v)
+                alu_lanes_scalar("^", vals[block], vals[block], c1_s)
+            for block in ids:
+                vec_op("^", vals[block], vals[block], tmp0s[block])
 
-        body = []  # array of slots
+            for block in ids:
+                vec_madd(vals[block], vals[block], m33_v, c2_v)
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+            for block in ids:
+                vec_op("<<", tmp0s[block], vals[block], sh9_v)
+                alu_lanes_scalar("+", vals[block], vals[block], c3_s)
+            for block in ids:
+                vec_op("^", vals[block], vals[block], tmp0s[block])
 
-        for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+            for block in ids:
+                vec_madd(vals[block], vals[block], m9_v, c4_v)
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
-        # Required to match with the yield in reference_kernel2
-        self.instrs.append({"flow": [("pause",)]})
+            for block in ids:
+                vec_op(">>", tmp0s[block], vals[block], sh16_v)
+                alu_lanes_scalar("^", vals[block], vals[block], c5_s)
+            for block in ids:
+                vec_op("^", vals[block], vals[block], tmp0s[block])
+
+        def emit_parity(dest, val, use_scalar=False):
+            if use_scalar:
+                scalar_parity(dest, val)
+            else:
+                vec_op("&", dest, val, one_v)
+
+        def round_root(ids, use_scalar_and):
+            for block in ids:
+                vec_op("^", vals[block], vals[block], root_node_v)
+            emit_hash(ids)
+            for block in ids:
+                emit_parity(idxs[block], vals[block], use_scalar_and)
+
+        def round_depth1(ids):
+            for block in ids:
+                vec_select(tmp0s[block], idxs[block], d1_n1, d1_n0)
+                vec_op("^", vals[block], vals[block], tmp0s[block])
+            emit_hash(ids)
+            for block in ids:
+                emit_parity(tmp0s[block], vals[block])
+                vec_madd(idxs[block], idxs[block], two_v, tmp0s[block])
+
+        def round_depth2(ids):
+            for block in ids:
+                vec_op("&", bit0, idxs[block], one_v)
+                vec_op(">>", bit1, idxs[block], one_v)
+                vec_select(tmp0s[block], bit0, d2_n1, d2_n0)
+                vec_select(mix, bit0, d2_diff1, d2_diff0)
+                vec_madd(tmp0s[block], bit1, mix, tmp0s[block])
+                vec_op("^", vals[block], vals[block], tmp0s[block])
+            emit_hash(ids)
+            for block in ids:
+                emit_parity(tmp0s[block], vals[block])
+                vec_madd(idxs[block], idxs[block], two_v, tmp0s[block])
+
+        def round_depth3(ids):
+            for block in ids:
+                vec_op("&", bit0, idxs[block], one_v)
+                vec_op(">>", bit1, idxs[block], one_v)
+                vec_op("&", bit2, bit1, one_v)
+                vec_op(">>", bit1, idxs[block], two_v)
+                vec_select(tmp0s[block], bit0, d3_n1, d3_n0)
+                vec_select(mix, bit0, d3_diff_lo1, d3_diff_lo0)
+                vec_madd(tmp0s[block], bit2, mix, tmp0s[block])
+                vec_select(pair, bit0, d3_n5, d3_n4)
+                vec_select(mix, bit0, d3_diff_hi1, d3_diff_hi0)
+                vec_madd(pair, bit2, mix, pair)
+                vec_select(tmp0s[block], bit1, pair, tmp0s[block])
+                alu_lanes("^", vals[block], vals[block], tmp0s[block])
+            emit_hash(ids)
+            for block in ids:
+                emit_parity(tmp0s[block], vals[block])
+                vec_madd(idxs[block], idxs[block], two_v, tmp0s[block])
+                vec_op("+", idxs[block], idxs[block], depth4_base_v)
+
+        def round_gather(ids, update_idx):
+            for block in ids:
+                for lane in range(VLEN):
+                    add_task(
+                        "load",
+                        ("load_offset", tmp0s[block], idxs[block], lane),
+                        reads=(idxs[block] + lane,),
+                        writes=(tmp0s[block] + lane,),
+                    )
+                vec_op("^", vals[block], vals[block], tmp0s[block])
+            emit_hash(ids)
+            if update_idx:
+                for block in ids:
+                    emit_parity(tmp0s[block], vals[block])
+                    vec_select(tmp1s[block], tmp0s[block], add_odd_v, add_even_v)
+                    vec_madd(idxs[block], idxs[block], two_v, tmp1s[block])
+
+        def emit_round(ids, round_i):
+            depth = round_i if round_i <= forest_height else round_i - (forest_height + 1)
+            if depth == 0:
+                round_root(ids, use_scalar_and=(round_i == 0))
+            elif depth == 1:
+                round_depth1(ids)
+            elif depth == 2:
+                round_depth2(ids)
+            elif depth == 3:
+                round_depth3(ids)
+            else:
+                round_gather(
+                    ids,
+                    update_idx=(round_i != forest_height and round_i != rounds - 1),
+                )
+
+        for schedule_round in range(rounds + stagger * (n_groups - 1)):
+            for group, ids in enumerate(group_ids):
+                round_i = schedule_round - group * stagger
+                if 0 <= round_i < rounds:
+                    emit_round(ids, round_i)
+
+        for block in tile_ids:
+            add_task(
+                "store",
+                ("vstore", store_addrs[block], vals[block]),
+                reads=(store_addrs[block],) + tuple(range(vals[block], vals[block] + VLEN)),
+            )
+
+        self.instrs.extend(self.build_scheduled(tasks))
 
 BASELINE = 147734
 
