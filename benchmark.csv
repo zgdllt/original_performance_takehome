@@ -7,3 +7,33 @@ wavefront16_depth1_vselect,1142,passes official submission tests; best legal par
 depth23_vselect_tree,invalid,rejected; reduced VALU slots but failed correctness
 wavefront13_precompute_war_offsets,1102,passes official submission tests; precomputed shallow next-node values plus WAR-aware scheduler and custom offsets
 hash23_fused_rescan,1098,passes official submission tests; combines hash stages 2 and 3 into two multiply_adds plus xor and rescans WAR-blocked candidates within each engine
+gather_parity_scalar,1097,passes official submission tests; moves deep-gather parity extraction from VALU to scalar ALU for a 1-cycle improvement
+const_to_flow_constants,1140,rejected; moved const generation from load to flow and reduced load slots but worsened dependency scheduling
+shallow_xor_to_alu,1099,rejected; moved shallow node xor operations to scalar ALU but increased total schedule length
+scalar_idx_depth4_7,1104,rejected; moved depth4-depth7 index updates from VALU multiply_add to scalar ALU but schedule length worsened
+leaf_root_fold,1097,passes official submission tests; folds the post-leaf root xor into the leaf hash final scalar xor and reduces VALU slots without changing cycle count
+deep_gather_xor_scalar,1097,passes official submission tests; moves deep gather node xor from VALU to scalar ALU so VALU and ALU lower bounds are both below 1000
+final_d4_select20,invalid,rejected; partial final depth4 selection tree lowered load slots to 1987 but failed correctness and scheduled at 1137 cycles before validation
+final_d4_select8,1087,passes official submission tests; corrected final depth4 selection tree for 8 blocks reduces final gather load slots while keeping local schedule balanced
+final_d4_select8_staggered,1072,passes official submission tests; same selection work as final_d4_select8 but selects staggered blocks to reduce local schedule pressure
+final_d4_select10_staggered,1065,passes official submission tests; expands corrected final depth4 selection to 10 staggered blocks with improved schedule balance
+final_d4_select11_high_tmp,1064,passes official submission tests; adds a shared high-half temp and expands final depth4 selection to 11 staggered blocks
+early_d4_select2,1057,passes official submission tests; reuses the depth4 selection table for two staggered first-depth4 blocks
+retuned_offsets_after_d4_select,1053,passes official submission tests; retunes wavefront offsets after final and early depth4 selection changes
+depth4_base_plus_parity,1052,passes official submission tests; replaces depth4 22/23 selects with 22+parity and removes redundant constants
+final_d4_block19_scalar_bits,1048,passes official submission tests; adds final depth4 select for block 19 with ALU selector-bit extraction
+final_d4_swap3_to2_with_block19,1047,passes official submission tests; swaps final depth4 selected block 3 to block 2 while keeping block 19 scalar-bit selection
+early_d4_block20_scalar_bits,1045,passes official submission tests; adds early depth4 select for block 20 with ALU selector-bit extraction
+final_d4_block29_pair_rebalance,1044,passes official submission tests; adds final depth4 select for block 29 and retunes d4_flow_pairs to {0,2,4}
+final_d4_block20_pair_rebalance,1043,passes official submission tests; adds final depth4 select for block 20 and retunes d4_flow_pairs to {0,3,4}
+depth4_blockset_random_search_651,1043,rejected/no-improve; 651 build-only variants over final/early depth4 blocks scalar-bit sets and d4_flow_pairs found no cycle below current best
+tile_order_random_search_503,1043,rejected/no-improve; 503 build-only tile_id permutation variants found no cycle below current natural block order
+valu_c5_final_block30,1036,passes official submission tests; moves final-round block 30 c5 xor from scalar ALU lanes to one VALU xor and shortens tail by 1 cycle
+d4_all_madd_early18,1035,passes official submission tests; frees flow by using madd for all d4 pairs and spends that slack on early depth4 block 18 to remove one more gather vector
+remove_final_d4_block20_after_all_madd,1034,passes official submission tests; after all-madd d4 pairs and early18, removing final block20 selector is faster despite restoring one gather vector
+restore_final_d4_block19_no20,1032,passes official submission tests; with all-madd d4 pairs and early18, final block19 selector is profitable while final block20 remains unprofitable
+early31_vector_bits_for29,1029,passes official submission tests; adds early depth4 block31 and removes block29 from scalar-bit extraction on the all-madd/block19/no20 mix
+d4_selector_early21_30_no_scalar,1026,passes official submission tests; final depth4 selection removes block 5, early depth4 adds blocks 21 and 30, scalar selector bits set emptied; slot profile load=1950 load_offset=1896 flow=871 valu=5997 alu=11769 store=32
+final_d4_local_tmp_reorder,invalid,rejected; attempted to use final-only idxs/tmp0s as block-local high temp/bit2 scratch for d4 selector, but overwrote tmp0 parity before remaining d4_pair_value operations; submission tests failed correctness and build schedule was 1027
+depth4_update_vselect_selective,1026,rejected/no-improve; selective flow-vselect depth3->depth4 index update can lower VALU floor to 999 for some block pairs but schedules no faster than 1026 and combines poorly with extra d4 selectors or d4_flow_pairs
+final_round_hash_xor_to_alu,1026,rejected/no-improve; moving final-round last hash xor from VALU to scalar ALU for selected blocks lowers VALU slots but does not reduce cycle count and larger sets worsen ALU tail

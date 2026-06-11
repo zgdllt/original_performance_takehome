@@ -238,7 +238,7 @@ class KernelBuilder:
         def load_scalar_const(addr, val):
             add_task("load", ("const", addr, val), writes=(addr,))
 
-        def init_vec_const(name, val):
+        def init_vec_const(name, val, keep_scalar=False):
             scalar = self.alloc_scratch(name + "_scalar")
             vec = alloc_vec(name)
             load_scalar_const(scalar, val)
@@ -248,7 +248,7 @@ class KernelBuilder:
                 reads=(scalar,),
                 writes=range(vec, vec + VLEN),
             )
-            return vec
+            return (vec, scalar) if keep_scalar else vec
 
         def alu_lanes(op, dest, a, b):
             for lane in range(VLEN):
@@ -278,27 +278,42 @@ class KernelBuilder:
                 )
 
         scratch_addr = self.alloc_scratch("scratch_addr")
-        scratch_scalar = self.alloc_scratch("scratch_scalar")
-
-        def load_tree_node_vec(name, abs_addr):
-            vec = alloc_vec(name)
-            load_scalar_const(scratch_addr, abs_addr)
+        tree_frontier = self.alloc_scratch("tree_frontier", 4 * VLEN)
+        load_scalar_const(scratch_addr, 7)
+        for chunk in range(4):
+            dest = tree_frontier + chunk * VLEN
             add_task(
                 "load",
-                ("load", scratch_scalar, scratch_addr),
+                ("vload", dest, scratch_addr),
                 reads=(scratch_addr,),
-                writes=(scratch_scalar,),
+                writes=range(dest, dest + VLEN),
             )
+            if chunk != 3:
+                add_task(
+                    "flow",
+                    ("add_imm", scratch_addr, scratch_addr, VLEN),
+                    reads=(scratch_addr,),
+                    writes=(scratch_addr,),
+                )
+
+        def tree_node_vec(name, abs_addr, keep_scalar=False):
+            vec = alloc_vec(name)
+            scalar = tree_frontier + abs_addr - 7
             add_task(
                 "valu",
-                ("vbroadcast", vec, scratch_scalar),
-                reads=(scratch_scalar,),
+                ("vbroadcast", vec, scalar),
+                reads=(scalar,),
                 writes=range(vec, vec + VLEN),
             )
-            return vec
+            return (vec, scalar) if keep_scalar else vec
 
-        one_v = init_vec_const("one_v", 1)
-        two_v = init_vec_const("two_v", 2)
+        def tree_node_vec_sequence(prefix, start_abs, count):
+            return [
+                tree_node_vec(f"{prefix}_{i}", start_abs + i) for i in range(count)
+            ]
+
+        one_v, one_s = init_vec_const("one_v", 1, keep_scalar=True)
+        two_v, two_s = init_vec_const("two_v", 2, keep_scalar=True)
         m4097_v = init_vec_const("m4097_v", 4097)
         m33_v = init_vec_const("m33_v", 33)
         m16896_v = init_vec_const("m16896_v", 16896)
@@ -310,46 +325,78 @@ class KernelBuilder:
         sh16_v = init_vec_const("sh16_v", 16)
         sh19_v = init_vec_const("sh19_v", 19)
         depth4_base_v = init_vec_const("depth4_base_v", 22)
-        depth4_odd_v = init_vec_const("depth4_odd_v", 23)
         add_even_v = init_vec_const("add_even_v", -6)
-        add_odd_v = init_vec_const("add_odd_v", -5)
+        add_odd_v = alloc_vec("add_odd_v")
+        vec_op("+", add_odd_v, add_even_v, one_v)
+        depth3_mask_v = alloc_vec("depth3_mask_v")
+        vec_op("-", depth3_mask_v, one_v, add_even_v)
 
-        one_s = self.alloc_scratch("one_s")
         c1_s = self.alloc_scratch("c1_s")
         c5_s = self.alloc_scratch("c5_s")
-        load_scalar_const(one_s, 1)
         load_scalar_const(c1_s, 0xC761C23C)
         load_scalar_const(c5_s, 0xB55A4F09)
+        c5_v = alloc_vec("c5_v")
+        add_task(
+            "valu",
+            ("vbroadcast", c5_v, c5_s),
+            reads=(c5_s,),
+            writes=range(c5_v, c5_v + VLEN),
+        )
 
-        root_node_v = load_tree_node_vec("root_node_v", 7)
+        root_node_v, root_node_s = tree_node_vec(
+            "root_node_v", 7, keep_scalar=True
+        )
+        c5_root_s = self.alloc_scratch("c5_root_s")
+        add_task(
+            "alu",
+            ("^", c5_root_s, c5_s, root_node_s),
+            reads=(c5_s, root_node_s),
+            writes=(c5_root_s,),
+        )
 
-        d1_n0 = load_tree_node_vec("d1_n0", 8)
-        d1_n1 = load_tree_node_vec("d1_n1", 9)
+        d1_nodes = [tree_node_vec(f"d1_node_{i}", 8 + i) for i in range(2)]
+        for node in d1_nodes:
+            vec_op("^", node, node, c5_v)
+        d1_n0, d1_n1 = reversed(d1_nodes)
 
-        d2_n0 = load_tree_node_vec("d2_n0", 10)
-        d2_n1 = load_tree_node_vec("d2_n1", 11)
-        d2_diff0 = load_tree_node_vec("d2_diff0", 12)
-        d2_diff1 = load_tree_node_vec("d2_diff1", 13)
+        d2_nodes = [tree_node_vec(f"d2_node_{i}", 10 + i) for i in range(4)]
+        for node in d2_nodes:
+            vec_op("^", node, node, c5_v)
+        d2_n0, d2_n1, d2_diff0, d2_diff1 = reversed(d2_nodes)
         vec_op("-", d2_diff0, d2_diff0, d2_n0)
         vec_op("-", d2_diff1, d2_diff1, d2_n1)
 
-        d3_n0 = load_tree_node_vec("d3_n0", 14)
-        d3_n1 = load_tree_node_vec("d3_n1", 15)
-        d3_diff_lo0 = load_tree_node_vec("d3_diff_lo0", 16)
-        d3_diff_lo1 = load_tree_node_vec("d3_diff_lo1", 17)
-        d3_n4 = load_tree_node_vec("d3_n4", 18)
-        d3_n5 = load_tree_node_vec("d3_n5", 19)
-        d3_diff_hi0 = load_tree_node_vec("d3_diff_hi0", 20)
-        d3_diff_hi1 = load_tree_node_vec("d3_diff_hi1", 21)
+        d3_nodes = [tree_node_vec(f"d3_node_{i}", 14 + i) for i in range(8)]
+        for node in d3_nodes:
+            vec_op("^", node, node, c5_v)
+        (
+            d3_n0,
+            d3_n1,
+            d3_diff_lo0,
+            d3_diff_lo1,
+            d3_n4,
+            d3_n5,
+            d3_diff_hi0,
+            d3_diff_hi1,
+        ) = reversed(d3_nodes)
         vec_op("-", d3_diff_lo0, d3_diff_lo0, d3_n0)
         vec_op("-", d3_diff_lo1, d3_diff_lo1, d3_n1)
         vec_op("-", d3_diff_hi0, d3_diff_hi0, d3_n4)
         vec_op("-", d3_diff_hi1, d3_diff_hi1, d3_n5)
 
+        d4_nodes = tree_node_vec_sequence("d4_node", 22, 16)
+        d4_even = [d4_nodes[2 * i] for i in range(8)]
+        d4_odd_or_diff = [d4_nodes[2 * i + 1] for i in range(8)]
+        d4_flow_pairs = set()
+        for i in range(8):
+            if i not in d4_flow_pairs:
+                vec_op("-", d4_odd_or_diff[i], d4_odd_or_diff[i], d4_even[i])
+
         bit0 = alloc_vec("bit0")
         bit1 = alloc_vec("bit1")
         mix = alloc_vec("mix")
         pair = alloc_vec("pair")
+        high_tmp = alloc_vec("high_tmp")
 
         n_vecs = batch_size // VLEN
         inp_values_p = 7 + n_nodes + batch_size
@@ -387,6 +434,7 @@ class KernelBuilder:
             store_addrs.append(base)
 
         tile_ids = list(range(n_vecs))
+        tile_ids[29], tile_ids[30] = tile_ids[30], tile_ids[29]
         n_groups = 13
         stagger = 2
         group_ids = [
@@ -394,7 +442,9 @@ class KernelBuilder:
             for g in range(n_groups)
         ]
 
-        def emit_hash(ids):
+        valu_c5_xor_blocks = {30}
+
+        def emit_hash(ids, final_xor_scalar=c5_s, round_i=None):
             for block in ids:
                 vec_madd(vals[block], vals[block], m4097_v, c0_v)
 
@@ -415,7 +465,15 @@ class KernelBuilder:
 
             for block in ids:
                 vec_op(">>", tmp0s[block], vals[block], sh16_v)
-                alu_lanes_scalar("^", vals[block], vals[block], c5_s)
+                if final_xor_scalar is not None:
+                    if (
+                        final_xor_scalar == c5_s
+                        and round_i == rounds - 1
+                        and block in valu_c5_xor_blocks
+                    ):
+                        vec_op("^", vals[block], vals[block], c5_v)
+                    else:
+                        alu_lanes_scalar("^", vals[block], vals[block], final_xor_scalar)
             for block in ids:
                 vec_op("^", vals[block], vals[block], tmp0s[block])
 
@@ -425,31 +483,42 @@ class KernelBuilder:
             else:
                 vec_op("&", dest, val, one_v)
 
-        def round_root(ids, use_scalar_and):
-            for block in ids:
-                vec_op("^", vals[block], vals[block], root_node_v)
-            emit_hash(ids)
+        def round_root(
+            ids,
+            round_i,
+            use_scalar_and,
+            root_already_xored=False,
+            use_valu_node_xor=False,
+        ):
+            if not root_already_xored:
+                for block in ids:
+                    vec_op("^", vals[block], vals[block], root_node_v)
+            emit_hash(ids, final_xor_scalar=None, round_i=round_i)
             for block in ids:
                 emit_parity(idxs[block], vals[block], use_scalar_and)
+                vec_select(tmp1s[block], idxs[block], d1_n1, d1_n0)
+                if use_valu_node_xor:
+                    vec_op("^", vals[block], vals[block], tmp1s[block])
+                else:
+                    alu_lanes("^", vals[block], vals[block], tmp1s[block])
 
-        def round_depth1(ids):
+        def round_depth1(ids, round_i, use_scalar_and, use_valu_node_xor=False):
+            emit_hash(ids, final_xor_scalar=None, round_i=round_i)
             for block in ids:
-                vec_select(tmp0s[block], idxs[block], d1_n1, d1_n0)
-                vec_op("^", vals[block], vals[block], tmp0s[block])
-            emit_hash(ids)
-            for block in ids:
-                emit_parity(tmp0s[block], vals[block])
+                emit_parity(tmp0s[block], vals[block], use_scalar_and)
                 vec_select(tmp1s[block], tmp0s[block], d2_n1, d2_n0)
                 vec_select(mix, tmp0s[block], d2_diff1, d2_diff0)
                 vec_madd(tmp1s[block], idxs[block], mix, tmp1s[block])
+                if use_valu_node_xor:
+                    vec_op("^", vals[block], vals[block], tmp1s[block])
+                else:
+                    alu_lanes("^", vals[block], vals[block], tmp1s[block])
                 vec_madd(idxs[block], idxs[block], two_v, tmp0s[block])
 
-        def round_depth2(ids):
+        def round_depth2(ids, round_i, use_scalar_and, use_valu_node_xor=False):
+            emit_hash(ids, final_xor_scalar=None, round_i=round_i)
             for block in ids:
-                vec_op("^", vals[block], vals[block], tmp1s[block])
-            emit_hash(ids)
-            for block in ids:
-                emit_parity(tmp0s[block], vals[block])
+                emit_parity(tmp0s[block], vals[block], use_scalar_and)
                 vec_op("&", bit0, idxs[block], one_v)
                 vec_op(">>", bit1, idxs[block], one_v)
                 vec_select(tmp1s[block], tmp0s[block], d3_n1, d3_n0)
@@ -459,51 +528,143 @@ class KernelBuilder:
                 vec_select(mix, tmp0s[block], d3_diff_hi1, d3_diff_hi0)
                 vec_madd(pair, bit0, mix, pair)
                 vec_select(tmp1s[block], bit1, pair, tmp1s[block])
+                if use_valu_node_xor:
+                    vec_op("^", vals[block], vals[block], tmp1s[block])
+                else:
+                    alu_lanes("^", vals[block], vals[block], tmp1s[block])
                 vec_madd(idxs[block], idxs[block], two_v, tmp0s[block])
 
-        def round_depth3(ids):
-            for block in ids:
-                vec_op("^", vals[block], vals[block], tmp1s[block])
-            emit_hash(ids)
-            for block in ids:
-                emit_parity(tmp0s[block], vals[block])
-                vec_select(tmp1s[block], tmp0s[block], depth4_odd_v, depth4_base_v)
-                vec_madd(idxs[block], idxs[block], two_v, tmp1s[block])
+        final_depth4_select_blocks = {2, 4, 6, 8, 9, 10, 12, 17, 18, 19, 27, 29}
+        early_depth4_select_blocks = {7, 18, 20, 21, 29, 30, 31}
+        scalar_bit_depth4_blocks = set()
 
-        def round_gather(ids, update_idx):
+        def d4_pair_value(dest, block, pair_i):
+            if pair_i in d4_flow_pairs:
+                vec_select(
+                    dest,
+                    tmp0s[block],
+                    d4_odd_or_diff[pair_i],
+                    d4_even[pair_i],
+                )
+            else:
+                vec_madd(dest, tmp0s[block], d4_odd_or_diff[pair_i], d4_even[pair_i])
+
+        def precompute_depth4_value(block):
+            if block in scalar_bit_depth4_blocks:
+                alu_lanes_scalar("&", bit0, idxs[block], one_s)
+                alu_lanes_scalar(">>", bit1, idxs[block], one_s)
+                alu_lanes_scalar("&", bit1, bit1, one_s)
+            else:
+                vec_op("&", bit0, idxs[block], one_v)
+                vec_op(">>", bit1, idxs[block], one_v)
+                vec_op("&", bit1, bit1, one_v)
+
+            d4_pair_value(mix, block, 7)
+            d4_pair_value(pair, block, 6)
+            vec_select(tmp1s[block], bit0, pair, mix)
+
+            d4_pair_value(mix, block, 5)
+            d4_pair_value(pair, block, 4)
+            vec_select(mix, bit0, pair, mix)
+            vec_select(tmp1s[block], bit1, mix, tmp1s[block])
+
+            d4_pair_value(mix, block, 3)
+            d4_pair_value(pair, block, 2)
+            vec_select(high_tmp, bit0, pair, mix)
+
+            d4_pair_value(mix, block, 1)
+            d4_pair_value(pair, block, 0)
+            vec_select(mix, bit0, pair, mix)
+            vec_select(mix, bit1, mix, high_tmp)
+
+            if block in scalar_bit_depth4_blocks:
+                alu_lanes_scalar(">>", bit0, idxs[block], two_s)
+            else:
+                vec_op(">>", bit0, idxs[block], two_v)
+            vec_select(tmp1s[block], bit0, mix, tmp1s[block])
+
+        def round_depth3(ids, round_i, use_scalar_and):
+            select_final_depth4 = round_i == rounds - 2
+            select_early_depth4 = round_i == 3
+            emit_hash(ids, round_i=round_i)
             for block in ids:
-                for lane in range(VLEN):
-                    add_task(
-                        "load",
-                        ("load_offset", tmp0s[block], idxs[block], lane),
-                        reads=(idxs[block] + lane,),
-                        writes=(tmp0s[block] + lane,),
-                    )
-                vec_op("^", vals[block], vals[block], tmp0s[block])
-            emit_hash(ids)
+                emit_parity(tmp0s[block], vals[block], use_scalar_and)
+                if select_final_depth4 and block in final_depth4_select_blocks:
+                    precompute_depth4_value(block)
+                elif select_early_depth4 and block in early_depth4_select_blocks:
+                    precompute_depth4_value(block)
+                    vec_op("-", idxs[block], depth3_mask_v, idxs[block])
+                    vec_madd(idxs[block], idxs[block], two_v, depth4_base_v)
+                    vec_op("+", idxs[block], idxs[block], tmp0s[block])
+                else:
+                    vec_op("-", idxs[block], depth3_mask_v, idxs[block])
+                    vec_madd(idxs[block], idxs[block], two_v, depth4_base_v)
+                    vec_op("+", idxs[block], idxs[block], tmp0s[block])
+
+        def round_gather(ids, round_i, update_idx, use_scalar_and):
+            for block in ids:
+                if (
+                    round_i == rounds - 1
+                    and block in final_depth4_select_blocks
+                ) or (round_i == 4 and block in early_depth4_select_blocks):
+                    alu_lanes("^", vals[block], vals[block], tmp1s[block])
+                else:
+                    for lane in range(VLEN):
+                        add_task(
+                            "load",
+                            ("load_offset", tmp0s[block], idxs[block], lane),
+                            reads=(idxs[block] + lane,),
+                            writes=(tmp0s[block] + lane,),
+                        )
+                    alu_lanes("^", vals[block], vals[block], tmp0s[block])
+            final_xor_scalar = (
+                c5_root_s
+                if round_i == forest_height and round_i + 1 < rounds
+                else c5_s
+            )
+            emit_hash(ids, final_xor_scalar, round_i=round_i)
             if update_idx:
                 for block in ids:
-                    emit_parity(tmp0s[block], vals[block])
+                    emit_parity(tmp0s[block], vals[block], use_scalar_and)
                     vec_select(tmp1s[block], tmp0s[block], add_odd_v, add_even_v)
                     vec_madd(idxs[block], idxs[block], two_v, tmp1s[block])
 
         def emit_round(ids, round_i):
             depth = round_i if round_i <= forest_height else round_i - (forest_height + 1)
+            use_scalar_and = depth > 3
             if depth == 0:
-                round_root(ids, use_scalar_and=(round_i == 0))
+                round_root(
+                    ids,
+                    round_i=round_i,
+                    use_scalar_and=use_scalar_and,
+                    root_already_xored=(round_i == forest_height + 1),
+                    use_valu_node_xor=False,
+                )
             elif depth == 1:
-                round_depth1(ids)
+                round_depth1(
+                    ids,
+                    round_i,
+                    use_scalar_and,
+                    use_valu_node_xor=False,
+                )
             elif depth == 2:
-                round_depth2(ids)
+                round_depth2(
+                    ids,
+                    round_i,
+                    use_scalar_and,
+                    use_valu_node_xor=False,
+                )
             elif depth == 3:
-                round_depth3(ids)
+                round_depth3(ids, round_i, use_scalar_and)
             else:
                 round_gather(
                     ids,
+                    round_i=round_i,
                     update_idx=(round_i != forest_height and round_i != rounds - 1),
+                    use_scalar_and=use_scalar_and,
                 )
 
-        group_offsets = [0, 0, 6, 8, 8, 11, 12, 14, 17, 19, 20, 21, 22]
+        group_offsets = [0, 0, 6, 8, 8, 11, 13, 17, 15, 19, 20, 12, 22]
         for schedule_round in range(rounds + max(group_offsets)):
             for group, ids in enumerate(group_ids):
                 round_i = schedule_round - group_offsets[group]
